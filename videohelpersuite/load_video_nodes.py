@@ -492,7 +492,7 @@ class LoadVideoTrimUpload:
     Outputs are identical to VHS_LoadVideo, so this is a drop-in replacement.
     start_time and duration are in SECONDS and are converted to
     skip_first_frames / frame_load_cap against the effective rate (force_rate
-    when set, otherwise the source fps). duration = 0 means "run to the end",
+    when set, otherwise the source fps). duration = 0 means run to the end,
     matching frame_load_cap = 0.
     """
 
