@@ -474,6 +474,88 @@ class LoadVideoUpload:
         return True
 
 
+
+def _source_fps(path):
+    """Source fps, used to turn seconds into frame counts when force_rate is 0."""
+    try:
+        cap = cv2.VideoCapture(path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        return fps if fps and fps > 0 else 0
+    except Exception:
+        return 0
+
+
+class LoadVideoTrimUpload:
+    """Load Video (Upload) with a draggable trim timeline.
+
+    Outputs are identical to VHS_LoadVideo, so this is a drop-in replacement.
+    start_time and duration are in SECONDS and are converted to
+    skip_first_frames / frame_load_cap against the effective rate (force_rate
+    when set, otherwise the source fps). duration = 0 means "run to the end",
+    matching frame_load_cap = 0.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        input_dir = folder_paths.get_input_directory()
+        files = []
+        for f in os.listdir(input_dir):
+            if os.path.isfile(os.path.join(input_dir, f)):
+                file_parts = f.split('.')
+                if len(file_parts) > 1 and (file_parts[-1].lower() in video_extensions):
+                    files.append(f)
+        return {"required": {
+                    "video": (sorted(files),),
+                    "force_rate": (floatOrInt, {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
+                    "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
+                    "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX, 'disable': 0}),
+                    "start_time": ("FLOAT", {"default": 0, "min": 0, "max": BIGMAX, "step": .001, "widgetType": "VHSTIMESTAMP"}),
+                    "duration": ("FLOAT", {"default": 0, "min": 0, "max": BIGMAX, "step": .001, "widgetType": "VHSTIMESTAMP"}),
+                    "select_every_nth": ("INT", {"default": 1, "min": 1, "max": BIGMAX, "step": 1}),
+                    },
+                "optional": {
+                    "meta_batch": ("VHS_BatchManager",),
+                    "vae": ("VAE",),
+                    "format": get_load_formats(),
+                },
+                "hidden": {
+                    "force_size": "STRING",
+                    "unique_id": "UNIQUE_ID"
+                },
+                }
+
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
+
+    RETURN_TYPES = (imageOrLatent, "INT", "AUDIO", "VHS_VIDEOINFO")
+    RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info")
+
+    FUNCTION = "load_video"
+
+    def load_video(self, **kwargs):
+        path = folder_paths.get_annotated_filepath(strip_path(kwargs['video']))
+        kwargs['video'] = path
+        rate = kwargs.get('force_rate') or 0
+        if not rate:
+            rate = _source_fps(path)
+        start = kwargs.pop('start_time', 0.0) or 0.0
+        dur = kwargs.pop('duration', 0.0) or 0.0
+        kwargs['skip_first_frames'] = int(round(start * rate)) if rate else 0
+        kwargs['frame_load_cap'] = int(round(dur * rate)) if (rate and dur > 0) else 0
+        return load_video(**kwargs)
+
+    @classmethod
+    def IS_CHANGED(s, video, **kwargs):
+        image_path = folder_paths.get_annotated_filepath(video)
+        return calculate_file_hash(image_path)
+
+    @classmethod
+    def VALIDATE_INPUTS(s, video):
+        if not folder_paths.exists_annotated_filepath(video):
+            return "Invalid video file: {}".format(video)
+        return True
+
+
 class LoadVideoPath:
     @classmethod
     def INPUT_TYPES(s):
