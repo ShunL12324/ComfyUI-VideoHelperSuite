@@ -1,243 +1,289 @@
 import { app } from "../../../scripts/app.js";
 
 /*
- * Draggable trim timeline for VHS_LoadVideoTrim.
+ * Video-editor style trim bar, mounted directly onto the video preview of
+ * VHS_LoadVideoTrim.
  *
- * The server side already does everything we need: /vhs/viewvideo re-encodes a
- * preview honouring start_time + frame_load_cap, and /vhs/queryvideo hands back
- * the source duration/fps as node.video_query. All that was missing upstream was
- * a way to pick the range with the mouse instead of typing numbers, so this file
- * adds one widget and touches nothing else.
+ * This is a DOM overlay injected into the preview widget's own container rather
+ * than a LiteGraph canvas widget, for two reasons:
+ *   1. it is what a trim bar should feel like -- it sits under the video with two
+ *      draggable end handles, like any editor;
+ *   2. VHS's onNodeCreated rebuilds node.widgets and drops every widget with no
+ *      matching INPUT_TYPES entry, so a pure-UI LiteGraph widget gets silently
+ *      filtered straight back out.
  *
- * The node's own widgets stay plain widgets (NOT converted to inputs) -- that is
- * deliberate. VHS binds its preview refresh by iterating node.widgets, so a
- * widget converted to a linked input drops out of that loop and the preview goes
- * stale. Dragging here writes the widget values and fires their callbacks, which
- * is exactly what VHS's own numeric entry does.
+ * Everything else is reused rather than reimplemented: /vhs/queryvideo already
+ * reports the source duration/fps as node.video_query, and /vhs/viewvideo already
+ * re-encodes the preview honouring start_time + frame_load_cap. Dragging writes
+ * the node's own start_time / duration widgets and fires their callbacks, which
+ * is exactly what typing into them does.
+ *
+ * The widgets are deliberately left as widgets and not converted to inputs: VHS
+ * binds preview refresh by iterating node.widgets, so a widget turned into a
+ * linked input drops out of that loop and the preview goes stale.
  */
 
-const H = 54;              // widget height
-const PAD = 8;             // horizontal padding inside the widget
-const TRACK_H = 16;        // height of the scrub track
-const HANDLE_W = 7;        // grab handle width
-const HIT = 9;             // grab tolerance in px
+const CSS = `
+.vhs-trim { padding: 4px 2px 2px; user-select: none; font: 11px sans-serif; }
+.vhs-trim-track {
+  position: relative; height: 26px; border-radius: 4px; cursor: pointer;
+  background: repeating-linear-gradient(90deg,#242424 0 1px,#1b1b1b 1px 14px);
+  border: 1px solid #0e0e0e; box-shadow: inset 0 1px 3px rgba(0,0,0,.6);
+}
+.vhs-trim-dim { position: absolute; top: 0; bottom: 0; background: rgba(0,0,0,.55); pointer-events: none; }
+.vhs-trim-sel {
+  position: absolute; top: 0; bottom: 0; background: rgba(63,120,158,.34);
+  border-top: 2px solid #4d90bd; border-bottom: 2px solid #4d90bd; cursor: grab;
+}
+.vhs-trim-sel:active { cursor: grabbing; }
+.vhs-trim-h {
+  position: absolute; top: -2px; bottom: -2px; width: 11px; border-radius: 3px;
+  background: linear-gradient(#f0ae3d,#d2891f); border: 1px solid #8a5a12;
+  cursor: ew-resize; box-shadow: 0 1px 3px rgba(0,0,0,.5);
+}
+.vhs-trim-h::after {
+  content: ""; position: absolute; left: 4px; right: 4px; top: 7px; bottom: 7px;
+  border-left: 1px solid rgba(0,0,0,.45); border-right: 1px solid rgba(0,0,0,.45);
+}
+/* straddle the boundary rather than sitting outside it: with left:0% / left:100%
+   an un-straddled handle lands completely off the end of the track and cannot be
+   grabbed, which is exactly the state a fresh full-range selection starts in. */
+.vhs-trim-h-l, .vhs-trim-h-r { transform: translateX(-50%); }
+.vhs-trim-lab { display: flex; justify-content: space-between; color: #b9b9b9; padding: 3px 1px 0; }
+.vhs-trim-lab b { color: #e8e8e8; font-weight: 600; }
+.vhs-trim-hint { color: #777; }
+`;
 
-const C = {
-    track:      "#1c1c1c",
-    trackBord:  "#0f0f0f",
-    region:     "#3f789e",
-    regionHov:  "#5a9cc4",
-    handle:     "#e8a02a",
-    text:       "#cfcfcf",
-    textDim:    "#8a8a8a",
-    warn:       "#c05a5a",
-};
+function injectCSS() {
+    if (document.getElementById("vhs-trim-css")) return;
+    const el = document.createElement("style");
+    el.id = "vhs-trim-css";
+    el.textContent = CSS;
+    document.head.appendChild(el);
+}
 
-function fmtTime(t) {
+function fmt(t) {
     if (!isFinite(t) || t < 0) t = 0;
     const m = Math.floor(t / 60);
     const s = t - m * 60;
     return m > 0 ? `${m}:${s.toFixed(2).padStart(5, "0")}` : `${s.toFixed(2)}s`;
 }
 
-function getW(node, name) {
-    return node.widgets?.find((w) => w.name === name);
+const getW = (node, name) => node.widgets?.find((w) => w.name === name);
+
+function srcInfo(node) {
+    const s = node.video_query?.source;
+    if (!s?.duration) return null;
+    const forced = getW(node, "force_rate")?.value;
+    return { total: s.duration, fps: (forced && forced > 0) ? forced : (s.fps || 0) };
 }
 
-/** Effective rate that frame_load_cap is counted in (post force_rate). */
-function effRate(node) {
-    const fr = getW(node, "force_rate")?.value;
-    if (fr && fr > 0) return fr;
-    return node.video_query?.source?.fps || 0;
-}
-
-function sourceDuration(node) {
-    return node.video_query?.source?.duration || 0;
-}
-
-/** Write widget values, fire their callbacks, and refresh the preview params. */
-function commit(node, start, dur) {
-    const total = sourceDuration(node);
-    start = Math.max(0, Math.min(start, total));
-    dur = Math.max(0, Math.min(dur, total - start));
-
-    const sw = getW(node, "start_time");
-    const dw = getW(node, "duration");
-    if (sw) { sw.value = Math.round(start * 1000) / 1000; sw.callback?.(sw.value); }
-    if (dw) { dw.value = Math.round(dur * 1000) / 1000; dw.callback?.(dw.value); }
-
-    // The preview endpoint speaks start_time (seconds) + frame_load_cap (frames).
-    const rate = effRate(node);
-    node.updateParameters?.({
-        start_time: sw ? sw.value : 0,
-        frame_load_cap: rate && dur > 0 ? Math.round(dur * rate) : 0,
-    });
-    node.setDirtyCanvas(true, false);
-}
-
-function addTimeline(node) {
-    if (getW(node, "trim_timeline")) return;
-
-    const w = {
-        name: "trim_timeline",
-        type: "VHS.TRIMTIMELINE",
-        value: null,
-        // transient drag state
-        _drag: null,
-        _hover: null,
-
-        computeSize() { return [0, H]; },
-
-        // no serialisation: the real state lives in start_time / duration
-        serialize: false,
-
-        draw(ctx, n, width, y) {
-            const total = sourceDuration(n);
-            const x0 = PAD;
-            const x1 = width - PAD;
-            const tw = Math.max(1, x1 - x0);
-            const ty = y + 20;
-
-            ctx.save();
-            // track
-            ctx.fillStyle = C.track;
-            ctx.strokeStyle = C.trackBord;
-            ctx.beginPath();
-            ctx.roundRect(x0, ty, tw, TRACK_H, 3);
-            ctx.fill();
-            ctx.stroke();
-
-            if (!total) {
-                ctx.fillStyle = C.textDim;
-                ctx.font = "11px sans-serif";
-                ctx.textAlign = "center";
-                ctx.fillText("pick a video to enable the timeline", x0 + tw / 2, ty + 12);
-                ctx.restore();
-                return;
-            }
-
-            const start = getW(n, "start_time")?.value || 0;
-            let dur = getW(n, "duration")?.value || 0;
-            const shownDur = dur > 0 ? dur : total - start;   // 0 == run to the end
-
-            const sx = x0 + (start / total) * tw;
-            const ex = x0 + Math.min(1, (start + shownDur) / total) * tw;
-
-            // selected region
-            ctx.fillStyle = this._hover === "body" ? C.regionHov : C.region;
-            ctx.beginPath();
-            ctx.roundRect(sx, ty, Math.max(2, ex - sx), TRACK_H, 3);
-            ctx.fill();
-
-            // handles
-            ctx.fillStyle = C.handle;
-            for (const [hx, id] of [[sx, "start"], [ex, "end"]]) {
-                ctx.globalAlpha = this._hover === id || this._drag === id ? 1 : 0.85;
-                ctx.beginPath();
-                ctx.roundRect(hx - HANDLE_W / 2, ty - 3, HANDLE_W, TRACK_H + 6, 2);
-                ctx.fill();
-            }
-            ctx.globalAlpha = 1;
-
-            // labels
-            ctx.font = "11px sans-serif";
-            ctx.textBaseline = "alphabetic";
-            ctx.fillStyle = C.text;
-            ctx.textAlign = "left";
-            ctx.fillText(fmtTime(start), x0, y + 13);
-            ctx.textAlign = "center";
-            const rate = effRate(n);
-            const frames = rate ? Math.round(shownDur * rate) : 0;
-            const mid = dur > 0
-                ? `${fmtTime(shownDur)}  (${frames} f @ ${rate || "?"}fps)`
-                : `to end  (${fmtTime(shownDur)}, ${frames} f)`;
-            ctx.fillStyle = dur > 0 ? C.text : C.textDim;
-            ctx.fillText(mid, x0 + tw / 2, y + 13);
-            ctx.textAlign = "right";
-            ctx.fillStyle = C.text;
-            ctx.fillText(fmtTime(total), x1, y + 13);
-            ctx.restore();
-        },
-
-        mouse(event, pos, n) {
-            const total = sourceDuration(n);
-            if (!total) return false;
-            const width = n.size[0];
-            const x0 = PAD;
-            const x1 = width - PAD;
-            const tw = Math.max(1, x1 - x0);
-            const toT = (px) => Math.max(0, Math.min(total, ((px - x0) / tw) * total));
-
-            const start = getW(n, "start_time")?.value || 0;
-            let dur = getW(n, "duration")?.value || 0;
-            const shownDur = dur > 0 ? dur : total - start;
-            const sx = x0 + (start / total) * tw;
-            const ex = x0 + Math.min(1, (start + shownDur) / total) * tw;
-
-            if (event.type === "pointerdown") {
-                if (Math.abs(pos[0] - sx) <= HIT) this._drag = "start";
-                else if (Math.abs(pos[0] - ex) <= HIT) this._drag = "end";
-                else if (pos[0] > sx && pos[0] < ex) {
-                    this._drag = "body";
-                    this._grab = toT(pos[0]) - start;
-                } else {
-                    // click on empty track: move the window there, keep its length
-                    this._drag = "body";
-                    this._grab = shownDur / 2;
-                    commit(n, toT(pos[0]) - this._grab, dur);
-                }
-                return true;
-            }
-            if (event.type === "pointermove") {
-                if (!this._drag) {
-                    this._hover = Math.abs(pos[0] - sx) <= HIT ? "start"
-                        : Math.abs(pos[0] - ex) <= HIT ? "end"
-                            : (pos[0] > sx && pos[0] < ex) ? "body" : null;
-                    return false;
-                }
-                const t = toT(pos[0]);
-                if (this._drag === "start") {
-                    const end = start + shownDur;
-                    const ns = Math.min(t, end - 0.02);
-                    commit(n, ns, dur > 0 ? end - ns : 0);
-                } else if (this._drag === "end") {
-                    commit(n, start, Math.max(0.02, t - start));
-                } else {
-                    commit(n, t - this._grab, dur);
-                }
-                return true;
-            }
-            if (event.type === "pointerup") {
-                this._drag = null;
-                return true;
-            }
-            return false;
-        },
-    };
-
-    node.widgets.push(w);
-    // keep the timeline live as soon as VHS finishes probing the file
+function mount(node) {
     const pv = getW(node, "videopreview");
-    if (pv) {
-        const orig = pv.callback;
-        pv.callback = function (...a) {
-            const r = orig?.apply(this, a);
-            setTimeout(() => node.setDirtyCanvas(true, false), 250);
+    const host = pv?.parentEl;
+    if (!host || host.querySelector(".vhs-trim")) return false;
+    injectCSS();
+
+    const wrap = document.createElement("div");
+    wrap.className = "vhs-trim";
+    wrap.innerHTML =
+        '<div class="vhs-trim-track">' +
+        '<div class="vhs-trim-dim vhs-trim-dim-l"></div>' +
+        '<div class="vhs-trim-dim vhs-trim-dim-r"></div>' +
+        '<div class="vhs-trim-sel"></div>' +
+        '<div class="vhs-trim-h vhs-trim-h-l"></div>' +
+        '<div class="vhs-trim-h vhs-trim-h-r"></div>' +
+        "</div>" +
+        '<div class="vhs-trim-lab"><span class="a"></span><span class="b"></span><span class="c"></span></div>';
+    host.appendChild(wrap);
+
+    const track = wrap.querySelector(".vhs-trim-track");
+    const sel = wrap.querySelector(".vhs-trim-sel");
+    const hL = wrap.querySelector(".vhs-trim-h-l");
+    const hR = wrap.querySelector(".vhs-trim-h-r");
+    const dimL = wrap.querySelector(".vhs-trim-dim-l");
+    const dimR = wrap.querySelector(".vhs-trim-dim-r");
+    const labA = wrap.querySelector(".a");
+    const labB = wrap.querySelector(".b");
+    const labC = wrap.querySelector(".c");
+
+    // live drag values; committed to the widgets on release
+    let st = 0, du = 0;
+
+    function read() {
+        st = getW(node, "start_time")?.value || 0;
+        du = getW(node, "duration")?.value || 0;
+    }
+
+    function render() {
+        const info = srcInfo(node);
+        if (!info) {
+            labA.textContent = "";
+            labB.innerHTML = '<span class="vhs-trim-hint">choose a video to enable trimming</span>';
+            labC.textContent = "";
+            sel.style.left = "0%"; sel.style.width = "100%";
+            hL.style.left = "0%"; hR.style.left = "100%";
+            dimL.style.width = "0"; dimR.style.left = "100%"; dimR.style.width = "0";
+            return;
+        }
+        const total = info.total;
+        const fps = info.fps;
+        const shown = du > 0 ? du : total - st;
+        const p0 = Math.max(0, Math.min(1, st / total));
+        const p1 = Math.max(p0, Math.min(1, (st + shown) / total));
+        sel.style.left = p0 * 100 + "%";
+        sel.style.width = (p1 - p0) * 100 + "%";
+        hL.style.left = p0 * 100 + "%";
+        hR.style.left = p1 * 100 + "%";
+        dimL.style.left = "0"; dimL.style.width = p0 * 100 + "%";
+        dimR.style.left = p1 * 100 + "%"; dimR.style.width = (1 - p1) * 100 + "%";
+        const frames = fps ? Math.round(shown * fps) : 0;
+        labA.innerHTML = "in <b>" + fmt(st) + "</b>";
+        labB.innerHTML = du > 0
+            ? "<b>" + fmt(shown) + "</b> &nbsp;" + frames + " f"
+            : '<span class="vhs-trim-hint">to end &nbsp;' + fmt(shown) + " &nbsp;" + frames + " f</span>";
+        labC.innerHTML = "out <b>" + fmt(st + shown) + "</b>";
+    }
+
+    /** push st/du into the node's widgets. fire=true also refreshes the preview. */
+    function commit(fire) {
+        const info = srcInfo(node);
+        if (!info) return;
+        const sw = getW(node, "start_time");
+        const dw = getW(node, "duration");
+        const sv = Math.round(st * 1000) / 1000;
+        const dv = Math.round(du * 1000) / 1000;
+        if (sw) sw.value = sv;
+        if (dw) dw.value = dv;
+        if (fire) {
+            sw?.callback?.(sv);
+            dw?.callback?.(dv);
+            node.updateParameters?.({
+                start_time: sv,
+                frame_load_cap: info.fps && dv > 0 ? Math.round(dv * info.fps) : 0,
+            });
+        }
+        node.setDirtyCanvas(true, false);
+    }
+
+    function tAt(clientX) {
+        const info = srcInfo(node);
+        const r = track.getBoundingClientRect();
+        const p = Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width)));
+        return p * info.total;
+    }
+
+    function beginDrag(mode, ev) {
+        const info = srcInfo(node);
+        if (!info) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        read();
+        const shown0 = du > 0 ? du : info.total - st;
+        const grab = tAt(ev.clientX) - st;
+        const MIN = Math.max(0.02, info.fps ? 1 / info.fps : 0.02);
+
+        const move = (e) => {
+            const t = tAt(e.clientX);
+            if (mode === "l") {
+                const out = st + (du > 0 ? du : info.total - st);
+                const ns = Math.max(0, Math.min(t, out - MIN));
+                du = out - ns;          // dragging the in-point pins the out-point
+                st = ns;
+            } else if (mode === "r") {
+                du = Math.max(MIN, Math.min(t, info.total) - st);
+            } else {
+                st = Math.max(0, Math.min(t - grab, info.total - shown0));
+                du = shown0;
+            }
+            commit(false);
+            render();
+        };
+        const up = () => {
+            // the capture flag MUST match addEventListener's or the listener is never
+            // removed: every drag would then leave a live handler behind and the stale
+            // one keeps rewriting the values on the next drag.
+            window.removeEventListener("pointermove", move, true);
+            window.removeEventListener("pointerup", up, true);
+            commit(true);               // one preview refresh, on release
+            render();
+        };
+        window.addEventListener("pointermove", move, true);
+        window.addEventListener("pointerup", up, true);
+    }
+
+    // ComfyUI's canvas layer calls stopPropagation on pointerdown during the CAPTURE
+    // phase, before the event can reach a DOM widget's children -- verified by probing:
+    // window-capture and document-capture both see it with the handle as target, and
+    // nothing below document ever fires. (VHS's own <video controls> is unaffected only
+    // because native media controls are handled by the browser, not by JS listeners.)
+    // So bind once on document in the capture phase and route by target instead.
+    const onDown = (e) => {
+        if (!wrap.isConnected) {
+            document.removeEventListener("pointerdown", onDown, true);
+            return;
+        }
+        const t = e.target;
+        if (!wrap.contains(t)) return;
+        let mode = null;
+        if (t === hL) mode = "l";
+        else if (t === hR) mode = "r";
+        else if (t === sel) mode = "m";
+        else if (t === track) mode = "seek";
+        else return;
+        e.preventDefault();
+        e.stopPropagation();          // keep the canvas from dragging the node too
+        if (mode !== "seek") { beginDrag(mode, e); return; }
+        const info = srcInfo(node);
+        if (!info) return;
+        read();
+        const shown = du > 0 ? du : info.total - st;
+        st = Math.max(0, Math.min(tAt(e.clientX) - shown / 2, info.total - shown));
+        du = shown;
+        commit(true);
+        render();
+    };
+    document.addEventListener("pointerdown", onDown, true);
+
+    // keep in sync when the values are typed in instead of dragged
+    for (const nm of ["start_time", "duration", "force_rate"]) {
+        const w = getW(node, nm);
+        if (!w) continue;
+        const orig = w.callback;
+        w.callback = function (...a) {
+            const r = orig ? orig.apply(this, a) : undefined;
+            read();
+            render();
             return r;
         };
     }
+
+    node.__vhsTrimRender = () => { read(); render(); };
+    read();
+    render();
+    return true;
+}
+
+/** The preview widget and video_query only exist after VHS has probed the file. */
+function attach(node) {
+    let tries = 0;
+    const tick = () => {
+        if (mount(node)) {
+            let n2 = 0;
+            const poll = setInterval(() => {
+                node.__vhsTrimRender && node.__vhsTrimRender();
+                if (node.video_query?.source?.duration || ++n2 > 80) clearInterval(poll);
+            }, 250);
+            return;
+        }
+        if (++tries < 80) setTimeout(tick, 250);
+    };
+    tick();
 }
 
 app.registerExtension({
     name: "VideoHelperSuite.TrimTimeline",
-    async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData?.name !== "VHS_LoadVideoTrim") return;
-        const orig = nodeType.prototype.onNodeCreated;
-        nodeType.prototype.onNodeCreated = function () {
-            const r = orig?.apply(this, arguments);
-            addTimeline(this);
-            this.setSize(this.computeSize());
-            return r;
-        };
+    async nodeCreated(node) {
+        if (node && node.comfyClass === "VHS_LoadVideoTrim") attach(node);
     },
 });
