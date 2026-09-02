@@ -670,7 +670,7 @@ function initializeLoadFormat(nodeType, nodeData) {
 
         });
         let capWidget = this.widgets.find((w) => w.name === "frame_load_cap")
-        capWidget.annotation = (value, width) => {
+        if (capWidget) capWidget.annotation = (value, width) => {
             let max_frames = this.video_query?.loaded?.frames
             if (!max_frames || value && value < max_frames) {
                 return
@@ -685,7 +685,7 @@ function initializeLoadFormat(nodeType, nodeData) {
             return loadable_frames + "\u21FD"
         }
         let rateWidget = this.widgets.find((w) => w.name === "force_rate")
-        rateWidget.annotation = (value, width) => {
+        if (rateWidget) rateWidget.annotation = (value, width) => {
             if (value == 0 && this.video_query?.source?.fps != undefined) {
                 return roundToPrecision(this.video_query.source.fps, 2) + "\u21FD"
             }
