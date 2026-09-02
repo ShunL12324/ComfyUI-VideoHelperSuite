@@ -1,4 +1,4 @@
-import { app } from "../../scripts/app.js";
+import { app } from "../../../scripts/app.js";
 
 /*
  * Draggable trim timeline for VHS_LoadVideoTrim.
