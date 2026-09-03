@@ -1,26 +1,29 @@
 import { app } from "../../../scripts/app.js";
 
 /*
- * Video-editor style trim bar, mounted directly onto the video preview of
- * VHS_LoadVideoTrim.
+ * Video-editor style controls mounted directly onto the video preview of
+ * VHS_LoadVideoTrim: a playback bar (play/pause, +-5s, draggable scrub bar)
+ * and a trim bar (draggable in/out handles selecting start_time/duration).
  *
- * This is a DOM overlay injected into the preview widget's own container rather
- * than a LiteGraph canvas widget, for two reasons:
- *   1. it is what a trim bar should feel like -- it sits under the video with two
- *      draggable end handles, like any editor;
- *   2. VHS's onNodeCreated rebuilds node.widgets and drops every widget with no
- *      matching INPUT_TYPES entry, so a pure-UI LiteGraph widget gets silently
- *      filtered straight back out.
+ * Both are DOM overlays injected into the preview widget's own container
+ * rather than LiteGraph canvas widgets, for two reasons:
+ *   1. it's what these controls should feel like -- they sit under the video,
+ *      like any editor;
+ *   2. VHS's onNodeCreated rebuilds node.widgets and drops every widget with
+ *      no matching INPUT_TYPES entry, so a pure-UI LiteGraph widget gets
+ *      silently filtered straight back out.
  *
- * Everything else is reused rather than reimplemented: /vhs/queryvideo already
- * reports the source duration/fps as node.video_query, and /vhs/viewvideo already
- * re-encodes the preview honouring start_time + frame_load_cap. Dragging writes
- * the node's own start_time / duration widgets and fires their callbacks, which
- * is exactly what typing into them does.
+ * Everything reused rather than reimplemented: /vhs/queryvideo already
+ * reports the source duration/fps as node.video_query, /vhs/viewvideo
+ * already re-encodes the preview honouring start_time + frame_load_cap, and
+ * the preview's own <video> element (previewWidget.videoEl) is what the
+ * playback bar drives directly -- native controls are off (VHS sets
+ * `videoEl.controls = false`), so there is otherwise no way to play/seek it.
  *
- * The widgets are deliberately left as widgets and not converted to inputs: VHS
- * binds preview refresh by iterating node.widgets, so a widget turned into a
- * linked input drops out of that loop and the preview goes stale.
+ * The start_time/duration widgets are deliberately left as widgets and not
+ * converted to inputs: VHS binds preview refresh by iterating node.widgets,
+ * so a widget turned into a linked input drops out of that loop and the
+ * preview goes stale.
  */
 
 const CSS = `
@@ -52,6 +55,26 @@ const CSS = `
 .vhs-trim-lab { display: flex; justify-content: space-between; color: #b9b9b9; padding: 3px 1px 0; }
 .vhs-trim-lab b { color: #e8e8e8; font-weight: 600; }
 .vhs-trim-hint { color: #777; }
+
+.vhs-ctl { display: flex; align-items: center; gap: 5px; padding: 4px 2px 0; user-select: none; font: 11px sans-serif; }
+.vhs-ctl-btn {
+  flex: 0 0 auto; width: 24px; height: 20px; line-height: 20px; text-align: center;
+  border-radius: 4px; cursor: pointer; background: linear-gradient(#3a3a3a,#242424);
+  border: 1px solid #101010; color: #ddd; font-size: 11px;
+}
+.vhs-ctl-btn:hover { background: linear-gradient(#454545,#2c2c2c); }
+.vhs-ctl-btn.play { width: 26px; font-size: 10px; }
+.vhs-ctl-scrub {
+  position: relative; flex: 1 1 auto; height: 10px; border-radius: 5px; cursor: pointer;
+  background: #1c1c1c; border: 1px solid #0e0e0e; box-shadow: inset 0 1px 2px rgba(0,0,0,.6);
+}
+.vhs-ctl-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 0%; border-radius: 5px; background: rgba(77,144,189,.55); pointer-events: none; }
+.vhs-ctl-head {
+  position: absolute; top: 50%; width: 11px; height: 11px; border-radius: 50%;
+  background: linear-gradient(#f0ae3d,#d2891f); border: 1px solid #8a5a12;
+  transform: translate(-50%,-50%); box-shadow: 0 1px 2px rgba(0,0,0,.5);
+}
+.vhs-ctl-time { flex: 0 0 auto; color: #b9b9b9; font-variant-numeric: tabular-nums; white-space: nowrap; }
 `;
 
 function injectCSS() {
@@ -69,7 +92,63 @@ function fmt(t) {
     return m > 0 ? `${m}:${s.toFixed(2).padStart(5, "0")}` : `${s.toFixed(2)}s`;
 }
 
+function fmtClock(t) {
+    if (!isFinite(t) || t < 0) t = 0;
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t - m * 60);
+    return m + ":" + String(s).padStart(2, "0");
+}
+
 const getW = (node, name) => node.widgets?.find((w) => w.name === name);
+
+/**
+ * VHS's "Advanced Previews" transcode endpoint (/vhs/viewvideo, the DEFAULT for an
+ * input node like this one) pipes a live ffmpeg re-encode over the response with no
+ * `Accept-Ranges`/`Content-Range` support. Confirmed empirically: the browser reports
+ * readyState=4 and a full buffered range (it happily downloads the whole chunked
+ * stream sequentially), but writing videoEl.currentTime silently snaps back to ~0
+ * instead of landing anywhere near the requested time -- the resource is not actually
+ * seekable, regardless of what buffered/readyState claim.
+ * VHS's OTHER path (/view, used when Advanced Previews = 'Never') serves the raw
+ * uploaded file through ComfyUI's normal static-file endpoint: confirmed 206 Partial
+ * Content + Accept-Ranges: bytes, and seeking lands exactly on the requested time.
+ * A scrub bar is the whole point of this node, so it always wants the raw/seekable
+ * source regardless of the user's global Advanced Previews setting -- the trim bar
+ * communicates the selected range independently of whatever is actually playing, so
+ * nothing is lost by not showing the rate-adjusted transcode here.
+ * Implemented as a property override on videoEl.src (rather than trying to intercept
+ * VHS's own decision logic in updateSource(), which re-reads the global setting
+ * internally) so every future preview refresh is covered, not just the current one.
+ */
+function forceRawPreview(videoEl) {
+    const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+    Object.defineProperty(videoEl, 'src', {
+        configurable: true,
+        get() { return desc.get.call(this); },
+        set(v) {
+            try {
+                const u = new URL(v, location.href);
+                if (u.pathname.endsWith('/vhs/viewvideo')) {
+                    u.pathname = u.pathname.replace('/vhs/viewvideo', '/view');
+                    for (const k of ['start_time', 'skip_first_frames', 'frame_load_cap',
+                                     'force_size', 'deadline', 'select_every_nth']) {
+                        u.searchParams.delete(k);
+                    }
+                    v = u.toString();
+                }
+            } catch (e) { /* not a parseable URL (e.g. ""); leave it alone */ }
+            desc.set.call(this, v);
+        },
+    });
+}
+
+/** VHS's own fitHeight() (web/js/VHS.core.js) is private/unexported; same logic. */
+function fitNodeHeight(node) {
+    if (!node.graph) return;
+    const sz = node.computeSize([node.size[0], node.size[1]]);
+    node.setSize([node.size[0], sz[1]]);
+    node.graph.setDirtyCanvas(true);
+}
 
 function srcInfo(node) {
     const s = node.video_query?.source;
@@ -78,12 +157,119 @@ function srcInfo(node) {
     return { total: s.duration, fps: (forced && forced > 0) ? forced : (s.fps || 0) };
 }
 
-function mount(node) {
-    const pv = getW(node, "videopreview");
-    const host = pv?.parentEl;
-    if (!host || host.querySelector(".vhs-trim")) return false;
-    injectCSS();
+/** Playback bar: play/pause, +-5s, draggable scrub -- drives the preview's own <video>. */
+function mountPlayback(node, panel, videoEl) {
+    const wrap = document.createElement("div");
+    wrap.className = "vhs-ctl";
+    wrap.innerHTML =
+        '<div class="vhs-ctl-btn back5" title="-5s">-5</div>' +
+        '<div class="vhs-ctl-btn play" title="play/pause">&#9654;</div>' +
+        '<div class="vhs-ctl-btn fwd5" title="+5s">+5</div>' +
+        '<div class="vhs-ctl-scrub"><div class="vhs-ctl-fill"></div><div class="vhs-ctl-head"></div></div>' +
+        '<span class="vhs-ctl-time">0:00 / 0:00</span>';
+    panel.appendChild(wrap);
 
+    const btnBack = wrap.querySelector(".back5");
+    const btnPlay = wrap.querySelector(".play");
+    const btnFwd = wrap.querySelector(".fwd5");
+    const scrub = wrap.querySelector(".vhs-ctl-scrub");
+    const fill = wrap.querySelector(".vhs-ctl-fill");
+    const head = wrap.querySelector(".vhs-ctl-head");
+    const time = wrap.querySelector(".vhs-ctl-time");
+
+    let rafId = null;
+    let dragging = false;
+
+    function updateUI() {
+        const d = videoEl.duration;
+        const cur = videoEl.currentTime || 0;
+        const pct = isFinite(d) && d > 0 ? Math.max(0, Math.min(1, cur / d)) : 0;
+        fill.style.width = pct * 100 + "%";
+        head.style.left = pct * 100 + "%";
+        time.textContent = fmtClock(cur) + " / " + fmtClock(isFinite(d) ? d : 0);
+        btnPlay.innerHTML = videoEl.paused ? "&#9654;" : "&#10074;&#10074;";
+    }
+
+    function loop() {
+        updateUI();
+        if (!videoEl.paused && !videoEl.ended) {
+            rafId = requestAnimationFrame(loop);
+        } else {
+            rafId = null;
+        }
+    }
+    function kickLoop() {
+        if (rafId == null) rafId = requestAnimationFrame(loop);
+    }
+
+    videoEl.addEventListener("play", kickLoop);
+    videoEl.addEventListener("pause", updateUI);
+    videoEl.addEventListener("seeked", updateUI);
+    videoEl.addEventListener("loadedmetadata", updateUI);
+    videoEl.addEventListener("emptied", updateUI);
+    if (!videoEl.paused) kickLoop();
+    updateUI();
+
+    // videoEl has loop=true (set by VHS's addVideoPreview). Confirmed empirically:
+    // seeking to EXACTLY `duration` on a looping video makes the browser treat it as
+    // "reached the end" and immediately wrap back to ~0 -- so every clamp against the
+    // end must stay a hair short of it, or "+5s"/dragging to the far right silently
+    // lands back at the start instead of near the end.
+    const SEEK_EPS = 0.05;
+    function clampSeek(t, d) {
+        if (!isFinite(d) || d <= 0) return Math.max(0, t);
+        return Math.max(0, Math.min(t, d - SEEK_EPS));
+    }
+
+    function timeAt(clientX) {
+        const d = videoEl.duration;
+        if (!isFinite(d) || d <= 0) return 0;
+        const r = scrub.getBoundingClientRect();
+        const p = Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width)));
+        return clampSeek(p * d, d);
+    }
+
+    return {
+        el: wrap,
+        onDown(e, target) {
+            if (target === btnPlay) {
+                e.preventDefault(); e.stopPropagation();
+                if (videoEl.paused) videoEl.play().catch(() => {}); else videoEl.pause();
+                updateUI();
+                return true;
+            }
+            if (target === btnBack || target === btnFwd) {
+                e.preventDefault(); e.stopPropagation();
+                const delta = target === btnBack ? -5 : 5;
+                videoEl.currentTime = clampSeek((videoEl.currentTime || 0) + delta, videoEl.duration);
+                updateUI();
+                return true;
+            }
+            if (target === scrub || target === fill || target === head) {
+                e.preventDefault(); e.stopPropagation();
+                dragging = true;
+                videoEl.currentTime = timeAt(e.clientX);
+                updateUI();
+                const move = (ev) => {
+                    videoEl.currentTime = timeAt(ev.clientX);
+                    updateUI();
+                };
+                const up = () => {
+                    dragging = false;
+                    window.removeEventListener("pointermove", move, true);
+                    window.removeEventListener("pointerup", up, true);
+                };
+                window.addEventListener("pointermove", move, true);
+                window.addEventListener("pointerup", up, true);
+                return true;
+            }
+            return false;
+        },
+    };
+}
+
+/** Trim bar: draggable in/out handles selecting start_time/duration (seconds). */
+function mountTrim(node, panel) {
     const wrap = document.createElement("div");
     wrap.className = "vhs-trim";
     wrap.innerHTML =
@@ -95,7 +281,7 @@ function mount(node) {
         '<div class="vhs-trim-h vhs-trim-h-r"></div>' +
         "</div>" +
         '<div class="vhs-trim-lab"><span class="a"></span><span class="b"></span><span class="c"></span></div>';
-    host.appendChild(wrap);
+    panel.appendChild(wrap);
 
     const track = wrap.querySelector(".vhs-trim-track");
     const sel = wrap.querySelector(".vhs-trim-sel");
@@ -107,7 +293,6 @@ function mount(node) {
     const labB = wrap.querySelector(".b");
     const labC = wrap.querySelector(".c");
 
-    // live drag values; committed to the widgets on release
     let st = 0, du = 0;
 
     function read() {
@@ -200,17 +385,166 @@ function mount(node) {
             render();
         };
         const up = () => {
-            // the capture flag MUST match addEventListener's or the listener is never
-            // removed: every drag would then leave a live handler behind and the stale
-            // one keeps rewriting the values on the next drag.
             window.removeEventListener("pointermove", move, true);
             window.removeEventListener("pointerup", up, true);
-            commit(true);               // one preview refresh, on release
+            commit(true);
             render();
         };
         window.addEventListener("pointermove", move, true);
         window.addEventListener("pointerup", up, true);
     }
+
+    // reset when a DIFFERENT video is selected/uploaded -- see resetGuard() below
+    // for why this hook waits before treating a change as "real".
+    function resetForNewVideo() {
+        st = 0; du = 0;
+        const sw = getW(node, "start_time");
+        const dw = getW(node, "duration");
+        if (sw) sw.value = 0;
+        if (dw) dw.value = 0;
+        node.updateParameters?.({ start_time: 0, frame_load_cap: 0 });
+        render();
+        // video_query for the new file lands asynchronously (a queryvideo
+        // fetch); keep the displayed total in sync once it arrives.
+        let tries = 0;
+        const poll = setInterval(() => {
+            render();
+            if (node.video_query?.source?.duration || ++tries > 80) clearInterval(poll);
+        }, 250);
+    }
+
+    node.__vhsTrimRender = () => { read(); render(); };
+    node.__vhsTrimResetForNewVideo = resetForNewVideo;
+    read();
+    render();
+
+    return {
+        el: wrap,
+        onDown(e, target) {
+            let mode = null;
+            if (target === hL) mode = "l";
+            else if (target === hR) mode = "r";
+            else if (target === sel) mode = "m";
+            else if (target === track) mode = "seek";
+            else return false;
+            e.preventDefault();
+            e.stopPropagation();
+            if (mode !== "seek") { beginDrag(mode, e); return true; }
+            const info = srcInfo(node);
+            if (!info) return true;
+            read();
+            const shown = du > 0 ? du : info.total - st;
+            st = Math.max(0, Math.min(tAt(e.clientX) - shown / 2, info.total - shown));
+            du = shown;
+            commit(true);
+            render();
+            return true;
+        },
+        syncWidgets() {
+            for (const nm of ["start_time", "duration", "force_rate"]) {
+                const w = getW(node, nm);
+                if (!w) continue;
+                const orig = w.callback;
+                w.callback = function (...a) {
+                    const r = orig ? orig.apply(this, a) : undefined;
+                    read();
+                    render();
+                    return r;
+                };
+            }
+        },
+    };
+}
+
+/**
+ * Hooks the "video" widget so a genuinely new file selection/upload resets
+ * the trim window instead of leaving stale in/out points that may no longer
+ * fit the new file's duration.
+ *
+ * Multiple things can invoke widget.callback(widget.value) during a node's
+ * construction/configure sequence for reasons unrelated to a real video
+ * change (VHS re-fires several widgets' callbacks with their CURRENT value
+ * as part of its own setup). Rather than assume the exact ordering of those
+ * internal calls relative to a saved workflow's configure() step -- getting
+ * that wrong in either direction either misses real changes or wipes a just
+ * -loaded workflow's saved trim points -- this waits a short settle window
+ * after mount before treating any callback firing as a genuine change. That
+ * window comfortably covers construction-time callback storms (which
+ * complete synchronously/near-synchronously) while being far shorter than
+ * any realistic gap before a real user re-upload.
+ */
+function guardVideoChanges(node, onChanged) {
+    const videoW = getW(node, "video");
+    if (!videoW) return;
+    let ready = false;
+    let last = videoW.value;
+    setTimeout(() => { ready = true; }, 600);
+    const orig = videoW.callback;
+    videoW.callback = function (...a) {
+        const r = orig ? orig.apply(this, a) : undefined;
+        const v = videoW.value;
+        if (ready && v !== last) onChanged();
+        last = v;
+        return r;
+    };
+}
+
+function mount(node) {
+    const pv = getW(node, "videopreview");
+    const host = pv?.parentEl;
+    if (!host || host.querySelector(".vhs-ctl-panel")) return false;
+    injectCSS();
+
+    const panel = document.createElement("div");
+    panel.className = "vhs-ctl-panel";
+    host.appendChild(panel);
+
+    forceRawPreview(pv.videoEl);
+    // videoEl.src may already be set (e.g. reopening a saved workflow with a video
+    // already selected) -- re-trigger once so the existing src gets redirected too.
+    if (pv.videoEl.src) pv.updateSource?.();
+
+    const playback = mountPlayback(node, panel, pv.videoEl);
+    const trim = mountTrim(node, panel);
+    trim.syncWidgets();
+    guardVideoChanges(node, () => node.__vhsTrimResetForNewVideo());
+
+    // previewWidget.computeSize only ever accounted for the video's own aspect-ratio
+    // height (`(nodeWidth-20)/aspectRatio + 10`). It has no idea this panel exists, so
+    // without patching it the node's own allotted box never grows to contain the panel
+    // -- it overflows past the node's drawn boundary instead of the node resizing, and
+    // pointer hit-testing in that overflowed strip is unreliable since the canvas
+    // doesn't believe the node extends there.
+    const origComputeSize = pv.computeSize.bind(pv);
+    pv.computeSize = function (width) {
+        const [w, h] = origComputeSize(width);
+        // h<=0 is VHS's own "nothing loaded yet, don't display" sentinel (see
+        // addVideoPreview) -- leave it alone so the whole preview area (video +
+        // panel) stays collapsed until a video is actually chosen, exactly like
+        // it did before this panel existed.
+        if (h <= 0) return [w, h];
+        // getBoundingClientRect() returns real SCREEN pixels (already reflecting the
+        // canvas's current zoom), but computeSize must return LOGICAL/canvas-space
+        // units like `h` -- confirmed empirically: at ds.scale=0.55 the panel
+        // overflowed by ~9.4 screen px, and at 0.5 by ~5.5, i.e. scaling with zoom,
+        // not a fixed offset. VHS's own formula for `h` never has this problem since
+        // it's pure arithmetic on node.size (already logical), not a DOM measurement.
+        const scale = app.canvas?.ds?.scale || 1;
+        const panelLogicalH = (panel.getBoundingClientRect().height || 0) / scale;
+        return [w, h + panelLogicalH + 4];
+    };
+    fitNodeHeight(node);
+    // VHS calls its own (private, unexported) fitHeight() on the video's
+    // 'loadedmetadata' event once the aspect ratio becomes known for the first
+    // time; that recomputes via node.computeSize(), which now includes our
+    // panel height too since it goes through the wrapped computeSize above.
+    // We only need one more explicit call for whenever OUR panel's own height
+    // changes after the fact (e.g. the trim label growing to a second line).
+    const ro = new ResizeObserver(() => {
+        if (!panel.isConnected) { ro.disconnect(); return; }
+        fitNodeHeight(node);
+    });
+    ro.observe(panel);
 
     // ComfyUI's canvas layer calls stopPropagation on pointerdown during the CAPTURE
     // phase, before the event can reach a DOM widget's children -- verified by probing:
@@ -219,48 +553,15 @@ function mount(node) {
     // because native media controls are handled by the browser, not by JS listeners.)
     // So bind once on document in the capture phase and route by target instead.
     const onDown = (e) => {
-        if (!wrap.isConnected) {
+        if (!panel.isConnected) {
             document.removeEventListener("pointerdown", onDown, true);
             return;
         }
-        const t = e.target;
-        if (!wrap.contains(t)) return;
-        let mode = null;
-        if (t === hL) mode = "l";
-        else if (t === hR) mode = "r";
-        else if (t === sel) mode = "m";
-        else if (t === track) mode = "seek";
-        else return;
-        e.preventDefault();
-        e.stopPropagation();          // keep the canvas from dragging the node too
-        if (mode !== "seek") { beginDrag(mode, e); return; }
-        const info = srcInfo(node);
-        if (!info) return;
-        read();
-        const shown = du > 0 ? du : info.total - st;
-        st = Math.max(0, Math.min(tAt(e.clientX) - shown / 2, info.total - shown));
-        du = shown;
-        commit(true);
-        render();
+        if (!panel.contains(e.target)) return;
+        playback.onDown(e, e.target) || trim.onDown(e, e.target);
     };
     document.addEventListener("pointerdown", onDown, true);
 
-    // keep in sync when the values are typed in instead of dragged
-    for (const nm of ["start_time", "duration", "force_rate"]) {
-        const w = getW(node, nm);
-        if (!w) continue;
-        const orig = w.callback;
-        w.callback = function (...a) {
-            const r = orig ? orig.apply(this, a) : undefined;
-            read();
-            render();
-            return r;
-        };
-    }
-
-    node.__vhsTrimRender = () => { read(); render(); };
-    read();
-    render();
     return true;
 }
 
