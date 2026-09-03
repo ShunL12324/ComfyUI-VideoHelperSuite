@@ -2,13 +2,17 @@ import { app } from "../../../scripts/app.js";
 
 /*
  * Video-editor style controls mounted directly onto the video preview of
- * VHS_LoadVideoTrim: a playback bar (play/pause, +-5s, draggable scrub bar)
- * and a trim bar (draggable in/out handles selecting start_time/duration).
+ * VHS_LoadVideoTrim:
+ *   - a hover-only playback overlay on the video itself (play/pause, +-5s),
+ *     iOS-style: invisible until the pointer is over the video, then fades in;
+ *   - a full-width scrub bar + time label below the video (always visible);
+ *   - a trim bar below that: draggable in/out handles selecting
+ *     start_time/duration (seconds).
  *
- * Both are DOM overlays injected into the preview widget's own container
+ * These are DOM overlays injected into the preview widget's own container
  * rather than LiteGraph canvas widgets, for two reasons:
- *   1. it's what these controls should feel like -- they sit under the video,
- *      like any editor;
+ *   1. it's what these controls should feel like -- overlaying/sitting under
+ *      the video, like any editor or native player;
  *   2. VHS's onNodeCreated rebuilds node.widgets and drops every widget with
  *      no matching INPUT_TYPES entry, so a pure-UI LiteGraph widget gets
  *      silently filtered straight back out.
@@ -56,17 +60,14 @@ const CSS = `
 .vhs-trim-lab b { color: #e8e8e8; font-weight: 600; }
 .vhs-trim-hint { color: #777; }
 
-.vhs-ctl { display: flex; align-items: center; gap: 5px; padding: 4px 2px 0; user-select: none; font: 11px sans-serif; }
-.vhs-ctl-btn {
-  flex: 0 0 auto; width: 24px; height: 20px; line-height: 20px; text-align: center;
-  border-radius: 4px; cursor: pointer; background: linear-gradient(#3a3a3a,#242424);
-  border: 1px solid #101010; color: #ddd; font-size: 11px;
+.vhs-scrubwrap { padding: 4px 2px 0; user-select: none; font: 11px sans-serif; }
+.vhs-scrubwrap .vhs-ctl-time {
+  display: block; margin-bottom: 3px; color: #b9b9b9; font-variant-numeric: tabular-nums;
 }
-.vhs-ctl-btn:hover { background: linear-gradient(#454545,#2c2c2c); }
-.vhs-ctl-btn.play { width: 26px; font-size: 10px; }
 .vhs-ctl-scrub {
-  position: relative; flex: 1 1 auto; height: 10px; border-radius: 5px; cursor: pointer;
+  position: relative; width: 100%; height: 10px; border-radius: 5px; cursor: pointer;
   background: #1c1c1c; border: 1px solid #0e0e0e; box-shadow: inset 0 1px 2px rgba(0,0,0,.6);
+  box-sizing: border-box;
 }
 .vhs-ctl-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 0%; border-radius: 5px; background: rgba(77,144,189,.55); pointer-events: none; }
 .vhs-ctl-head {
@@ -74,7 +75,28 @@ const CSS = `
   background: linear-gradient(#f0ae3d,#d2891f); border: 1px solid #8a5a12;
   transform: translate(-50%,-50%); box-shadow: 0 1px 2px rgba(0,0,0,.5);
 }
-.vhs-ctl-time { flex: 0 0 auto; color: #b9b9b9; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* Hover-only playback overlay on the video itself (iOS-style). Always present in
+   the hit-test tree (pointer-events stays auto) so :hover has a stable target and
+   doesn't flicker; only opacity toggles. A real mouse always hovers before it can
+   click, so there is no "invisible button catches an accidental click" case in
+   practice for this desktop/canvas app. */
+.vhs-play-overlay {
+  position: absolute; left: 0; right: 0; top: 0;
+  display: flex; align-items: center; justify-content: center; gap: 18px;
+  background: radial-gradient(ellipse at center, rgba(0,0,0,.30) 0%, rgba(0,0,0,.06) 55%, rgba(0,0,0,0) 72%);
+  opacity: 0; transition: opacity .15s ease; user-select: none;
+}
+.vhs-play-overlay:hover { opacity: 1; }
+.vhs-ov-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 38px; height: 38px; border-radius: 50%;
+  background: rgba(20,20,20,.6); border: 1px solid rgba(255,255,255,.25);
+  color: #fff; font-size: 12px; cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0,0,0,.45);
+}
+.vhs-ov-btn:hover { background: rgba(45,45,45,.8); }
+.vhs-ov-btn.play { width: 50px; height: 50px; font-size: 17px; }
 `;
 
 function injectCSS() {
@@ -157,28 +179,46 @@ function srcInfo(node) {
     return { total: s.duration, fps: (forced && forced > 0) ? forced : (s.fps || 0) };
 }
 
-/** Playback bar: play/pause, +-5s, draggable scrub -- drives the preview's own <video>. */
-function mountPlayback(node, panel, videoEl) {
-    const wrap = document.createElement("div");
-    wrap.className = "vhs-ctl";
-    wrap.innerHTML =
-        '<div class="vhs-ctl-btn back5" title="-5s">-5</div>' +
-        '<div class="vhs-ctl-btn play" title="play/pause">&#9654;</div>' +
-        '<div class="vhs-ctl-btn fwd5" title="+5s">+5</div>' +
-        '<div class="vhs-ctl-scrub"><div class="vhs-ctl-fill"></div><div class="vhs-ctl-head"></div></div>' +
-        '<span class="vhs-ctl-time">0:00 / 0:00</span>';
-    panel.appendChild(wrap);
+/**
+ * Playback controls: a hover-only overlay on the video (play/pause, +-5s) plus an
+ * always-visible full-width scrub row below it. Both drive the preview's own <video>
+ * directly.
+ */
+function mountPlayback(node, host, scrubRow, videoEl) {
+    const overlay = document.createElement("div");
+    overlay.className = "vhs-play-overlay";
+    overlay.innerHTML =
+        '<div class="vhs-ov-btn back5" title="-5s">-5</div>' +
+        '<div class="vhs-ov-btn play" title="play/pause">&#9654;</div>' +
+        '<div class="vhs-ov-btn fwd5" title="+5s">+5</div>';
+    host.appendChild(overlay);
 
-    const btnBack = wrap.querySelector(".back5");
-    const btnPlay = wrap.querySelector(".play");
-    const btnFwd = wrap.querySelector(".fwd5");
-    const scrub = wrap.querySelector(".vhs-ctl-scrub");
-    const fill = wrap.querySelector(".vhs-ctl-fill");
-    const head = wrap.querySelector(".vhs-ctl-head");
-    const time = wrap.querySelector(".vhs-ctl-time");
+    scrubRow.innerHTML =
+        '<span class="vhs-ctl-time">0:00 / 0:00</span>' +
+        '<div class="vhs-ctl-scrub"><div class="vhs-ctl-fill"></div><div class="vhs-ctl-head"></div></div>';
+
+    const btnBack = overlay.querySelector(".back5");
+    const btnPlay = overlay.querySelector(".play");
+    const btnFwd = overlay.querySelector(".fwd5");
+    const scrub = scrubRow.querySelector(".vhs-ctl-scrub");
+    const fill = scrubRow.querySelector(".vhs-ctl-fill");
+    const head = scrubRow.querySelector(".vhs-ctl-head");
+    const time = scrubRow.querySelector(".vhs-ctl-time");
+
+    // keep the overlay's hit-test area matched to the video's own rendered size
+    // (clientHeight, not getBoundingClientRect -- both this and videoEl live under
+    // the same canvas-zoom transform, if any, so their LOCAL CSS sizes already agree
+    // without needing a scale conversion, unlike a cross-space comparison).
+    const ro = new ResizeObserver(() => {
+        if (!overlay.isConnected) { ro.disconnect(); return; }
+        overlay.style.height = videoEl.clientHeight + "px";
+    });
+    ro.observe(videoEl);
+    overlay.style.height = videoEl.clientHeight + "px";
 
     let rafId = null;
     let dragging = false;
+    let wasPlayingBeforeDrag = false;
 
     function updateUI() {
         const d = videoEl.duration;
@@ -192,14 +232,14 @@ function mountPlayback(node, panel, videoEl) {
 
     function loop() {
         updateUI();
-        if (!videoEl.paused && !videoEl.ended) {
+        if (!videoEl.paused && !videoEl.ended && !dragging) {
             rafId = requestAnimationFrame(loop);
         } else {
             rafId = null;
         }
     }
     function kickLoop() {
-        if (rafId == null) rafId = requestAnimationFrame(loop);
+        if (rafId == null && !dragging) rafId = requestAnimationFrame(loop);
     }
 
     videoEl.addEventListener("play", kickLoop);
@@ -230,7 +270,6 @@ function mountPlayback(node, panel, videoEl) {
     }
 
     return {
-        el: wrap,
         onDown(e, target) {
             if (target === btnPlay) {
                 e.preventDefault(); e.stopPropagation();
@@ -247,7 +286,11 @@ function mountPlayback(node, panel, videoEl) {
             }
             if (target === scrub || target === fill || target === head) {
                 e.preventDefault(); e.stopPropagation();
+                // don't fight the seek with active playback -- follow the pointer
+                // while dragging, then resume only if it was actually playing.
                 dragging = true;
+                wasPlayingBeforeDrag = !videoEl.paused;
+                if (wasPlayingBeforeDrag) videoEl.pause();
                 videoEl.currentTime = timeAt(e.clientX);
                 updateUI();
                 const move = (ev) => {
@@ -258,6 +301,8 @@ function mountPlayback(node, panel, videoEl) {
                     dragging = false;
                     window.removeEventListener("pointermove", move, true);
                     window.removeEventListener("pointerup", up, true);
+                    if (wasPlayingBeforeDrag) videoEl.play().catch(() => {});
+                    updateUI();
                 };
                 window.addEventListener("pointermove", move, true);
                 window.addEventListener("pointerup", up, true);
@@ -394,8 +439,8 @@ function mountTrim(node, panel) {
         window.addEventListener("pointerup", up, true);
     }
 
-    // reset when a DIFFERENT video is selected/uploaded -- see resetGuard() below
-    // for why this hook waits before treating a change as "real".
+    // reset when a DIFFERENT video is selected/uploaded -- see guardVideoChanges()
+    // below for why this hook waits before treating a change as "real".
     function resetForNewVideo() {
         st = 0; du = 0;
         const sw = getW(node, "start_time");
@@ -419,7 +464,6 @@ function mountTrim(node, panel) {
     render();
 
     return {
-        el: wrap,
         onDown(e, target) {
             let mode = null;
             if (target === hL) mode = "l";
@@ -495,16 +539,24 @@ function mount(node) {
     if (!host || host.querySelector(".vhs-ctl-panel")) return false;
     injectCSS();
 
+    // the hover overlay is position:absolute against this container; VHS never sets
+    // an explicit position on it, so this is safe to establish as the positioning
+    // context without disturbing anything else already in normal flow here.
+    host.style.position = host.style.position || "relative";
+
     const panel = document.createElement("div");
     panel.className = "vhs-ctl-panel";
     host.appendChild(panel);
+    const scrubRow = document.createElement("div");
+    scrubRow.className = "vhs-scrubwrap";
+    panel.appendChild(scrubRow);
 
     forceRawPreview(pv.videoEl);
     // videoEl.src may already be set (e.g. reopening a saved workflow with a video
     // already selected) -- re-trigger once so the existing src gets redirected too.
     if (pv.videoEl.src) pv.updateSource?.();
 
-    const playback = mountPlayback(node, panel, pv.videoEl);
+    const playback = mountPlayback(node, host, scrubRow, pv.videoEl);
     const trim = mountTrim(node, panel);
     trim.syncWidgets();
     guardVideoChanges(node, () => node.__vhsTrimResetForNewVideo());
@@ -514,7 +566,9 @@ function mount(node) {
     // without patching it the node's own allotted box never grows to contain the panel
     // -- it overflows past the node's drawn boundary instead of the node resizing, and
     // pointer hit-testing in that overflowed strip is unreliable since the canvas
-    // doesn't believe the node extends there.
+    // doesn't believe the node extends there. (The hover overlay does NOT need to be
+    // added here: it's absolutely positioned on top of the video's own already
+    // -accounted-for area, not extra normal-flow height like the panel below it.)
     const origComputeSize = pv.computeSize.bind(pv);
     pv.computeSize = function (width) {
         const [w, h] = origComputeSize(width);
@@ -552,12 +606,16 @@ function mount(node) {
     // nothing below document ever fires. (VHS's own <video controls> is unaffected only
     // because native media controls are handled by the browser, not by JS listeners.)
     // So bind once on document in the capture phase and route by target instead.
+    const overlay = host.querySelector(".vhs-play-overlay");
     const onDown = (e) => {
         if (!panel.isConnected) {
             document.removeEventListener("pointerdown", onDown, true);
             return;
         }
-        if (!panel.contains(e.target)) return;
+        // playback owns targets in BOTH containers (overlay buttons AND the scrub
+        // bar, which lives in panel's scrubRow) -- always try it first regardless
+        // of which container the target is in, then fall back to the trim bar.
+        if (!(overlay && overlay.contains(e.target)) && !panel.contains(e.target)) return;
         playback.onDown(e, e.target) || trim.onDown(e, e.target);
     };
     document.addEventListener("pointerdown", onDown, true);
