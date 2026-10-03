@@ -87,7 +87,7 @@ let originalHandleFile = app.handleFile;
 app.handleFile = handleFile;
 let fileInput = document.getElementById("comfy-file-input")
 //hijack comfy-file-input to allow webm/mp4/mkv
-fileInput.accept += ",video/webm,video/mp4,video/x-matroska";
+fileInput.accept += ",video/webm,video/mp4,video/x-matroska,video/quicktime,.mov";
 
 async function handleFile(file) {
     if (file?.type?.startsWith("video/") || isVideoFile(file)) {

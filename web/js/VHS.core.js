@@ -694,7 +694,7 @@ function initializeLoadFormat(nodeType, nodeData) {
 }
 
 function addUploadWidget(nodeType, nodeData, widgetName, type="video") {
-    let accept = {'video': ["video/webm","video/mp4","video/x-matroska","image/gif"],
+    let accept = {'video': ["video/webm","video/mp4","video/x-matroska","video/quicktime",".mov","image/gif"],
                   'audio': ["audio/mpeg","audio/wav","audio/x-wav","audio/ogg"]}
     chainCallback(nodeType.prototype, "onNodeCreated", function() {
         const node = this
@@ -745,7 +745,7 @@ function addUploadWidget(nodeType, nodeData, widgetName, type="video") {
                 },
             });
         } else {
-            let accept = {'video': ["video/webm","video/mp4","video/x-matroska","image/gif"],
+            let accept = {'video': ["video/webm","video/mp4","video/x-matroska","video/quicktime",".mov","image/gif"],
                           'audio': ["audio/mpeg","audio/wav","audio/x-wav","audio/ogg"]}[type]
             async function doUpload(file) {
                 let resp = await uploadFile(file, (p) => node.progress = p)
@@ -778,7 +778,9 @@ function addUploadWidget(nodeType, nodeData, widgetName, type="video") {
                 }
                 //TODO: Allow dragging multiple files at once?
                 const item = e.dataTransfer?.files?.[0]
-                if (accept.includes(item?.type)) {
+                // Some systems report no MIME type for .mov, so also accept by extension.
+                const ext = "." + (item?.name?.split(".").pop() ?? "").toLowerCase()
+                if (accept.includes(item?.type) || accept.includes(ext)) {
                     return await doUpload(item)
                 }
                 return false
