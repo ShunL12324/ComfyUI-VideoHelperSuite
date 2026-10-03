@@ -643,6 +643,7 @@ function attach(node) {
 app.registerExtension({
     name: "VideoHelperSuite.TrimTimeline",
     async nodeCreated(node) {
-        if (node && node.comfyClass === "VHS_LoadVideoTrim") attach(node);
+        // VHS_LoadVideoTrimSeek is a fast-seek variant registered by a companion extension.
+        if (node && (node.comfyClass === "VHS_LoadVideoTrim" || node.comfyClass === "VHS_LoadVideoTrimSeek")) attach(node);
     },
 });
